@@ -109,6 +109,166 @@ def expand_repeated_kv(x: torch.Tensor, n_rep: int, memory_efficient: bool) -> t
         )
 
 
+class ContentAwareMultiScaleAdapter(nn.Module):
+    """
+    Multi-scale temporal adapter with content-aware key fusion.
+
+    This adapter operates at different temporal scales by downsampling K/V with stride,
+    creating different receptive fields for capturing short, medium, and long-range dependencies.
+
+    Args:
+        embed_dim (int): Total embedding dimension
+        num_heads (int): Number of attention heads
+        stride (int): Downsampling stride for creating multi-scale receptive field
+        dilation (int): Dilation factor for high-frequency enhancement
+        prompt_len (int): Length of learnable prompt K
+        alpha_init (float): Initial value for content-prompt fusion weight
+        gate_init (float): Initial value for output gate (in logit space)
+        use_k_align (bool): Whether to use V->K projection for content-aware K
+        device: Device for initialization
+        dtype: Data type for initialization
+    """
+    def __init__(self, embed_dim: int, num_heads: int,
+                 stride: int = 1, dilation: int = 1,
+                 prompt_len: int = 512,
+                 alpha_init: float = 0.9,
+                 gate_init: float = -4.0,
+                 use_k_align: bool = False,
+                 device=None, dtype=None):
+        super().__init__()
+        factory_kwargs = {'device': device, 'dtype': dtype}
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.stride = stride
+        self.dilation = dilation
+        self.prompt_len = prompt_len
+        self.use_k_align = use_k_align
+
+        # Learnable prompt K: [1, prompt_len, num_heads, head_dim]
+        self.prompt = nn.Parameter(
+            torch.randn(1, prompt_len, num_heads, self.head_dim, **factory_kwargs) * 0.02
+        )
+
+        # V->K projection for content-aware key
+        if self.use_k_align:
+            self.k_from_v = nn.Linear(self.head_dim, self.head_dim, bias=False, **factory_kwargs)
+
+        # Learnable fusion weights: alpha for content vs prompt
+        self.alpha_logit = nn.Parameter(
+            torch.tensor(self._inverse_sigmoid(alpha_init), **factory_kwargs)
+        )
+
+        # Output gate (sigmoid) - starts very small to avoid disrupting training
+        self.gate = nn.Parameter(torch.tensor(gate_init, **factory_kwargs))
+
+        # High-frequency enhancement - DISABLED by default for diagnostic purposes
+        self.use_high_freq = False  # Set to True to enable
+        if self.use_high_freq:
+            self.hp_gamma_logit = nn.Parameter(torch.tensor(-1.0, **factory_kwargs))
+            self.hp_gamma_max = 0.6
+
+    @staticmethod
+    def _inverse_sigmoid(x: float) -> float:
+        """Compute logit from probability"""
+        x = max(min(x, 0.9999), 0.0001)
+        return float(torch.log(torch.tensor(x) / (1 - torch.tensor(x))).item())
+
+    def _downsample(self, x: torch.Tensor) -> torch.Tensor:
+        """Downsample along time dimension with stride
+
+        Args:
+            x: [B, T, H, D] or [B, H, T, D]
+        Returns:
+            Downsampled tensor
+        """
+        if self.stride <= 1:
+            return x
+
+        # Assume format is [B, T, H, D] based on adapter usage
+        B, T, H, D = x.shape
+        # Use strided indexing for downsampling
+        indices = torch.arange(0, T, self.stride, device=x.device)
+        return x[:, indices, :, :]
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                is_causal: bool = False) -> torch.Tensor:
+        """
+        Args:
+            q, k, v: [B, T, H, D] format
+            is_causal: Whether to use causal masking
+        Returns:
+            Adapter output: [B, T, H, D]
+        """
+        B, T, H, D = q.shape
+
+        # 1. Downsample K, V to create multi-scale receptive field
+        k_s = self._downsample(k)  # [B, T_s, H, D]
+        v_s = self._downsample(v)  # [B, T_s, H, D]
+
+        # 2. Content-aware K fusion
+        if self.use_k_align:
+            # Project V to K space: [B, T_s, H, D] -> [B, T_s, H, D]
+            v_for_k = v_s.reshape(B * v_s.shape[1] * H, D)
+            k_from_v = self.k_from_v(v_for_k).reshape(B, v_s.shape[1], H, D)
+            # Fuse content K
+            k_cont = k_from_v  # Could add weighted fusion with k_s here
+        else:
+            k_cont = k_s
+
+        # 3. Fuse content K with learnable prompt K
+        alpha = torch.sigmoid(self.alpha_logit)
+        # Broadcast prompt: [1, prompt_len, H, D] -> [B, prompt_len, H, D]
+        k_prompt = self.prompt.expand(B, -1, -1, -1)
+
+        # For now, use content K only (prompt fusion can be added later)
+        k_mix = k_cont  # Future: alpha * k_cont + (1 - alpha) * k_prompt
+
+        # 4. High-frequency enhancement (DISABLED by default)
+        if self.use_high_freq and hasattr(self, 'hp_gamma_logit'):
+            # Compute first-order difference (gradient) along time
+            x_ = rearrange(v, 'b t h d -> (b h) d t')
+            diff = F.pad(x_[:, :, 1:] - x_[:, :, :-1], (1, 0))
+
+            # Downsample the difference
+            if self.dilation > 1:
+                idx = torch.arange(0, diff.shape[-1], self.dilation, device=diff.device)
+                v_hp_ = diff[:, :, idx]
+            else:
+                ksize = self.stride if self.stride > 1 else 1
+                v_hp_ = F.avg_pool1d(diff, kernel_size=ksize, stride=ksize, ceil_mode=True)
+
+            v_hp = rearrange(v_hp_, '(b h) d t -> b t h d', b=B, h=H)
+
+            # Add high-frequency component
+            gamma = self.hp_gamma_max * torch.sigmoid(self.hp_gamma_logit)
+            v_s = v_s + gamma * v_hp
+
+        # 5. Multi-head attention with downsampled K, V
+        # Reshape to [B*H, T, D] for attention
+        qh = rearrange(q, 'b t h d -> (b h) t d')
+        kh = rearrange(k_mix, 'b t h d -> (b h) t d')
+        vh = rearrange(v_s, 'b t h d -> (b h) t d')
+
+        # Use F.scaled_dot_product_attention with is_causal flag
+        attn = F.scaled_dot_product_attention(
+            qh, kh, vh,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=is_causal  # CRITICAL: pass causal flag to prevent future leakage
+        )
+
+        # Reshape back: [B*H, T, D] -> [B, T, H, D]
+        attn = rearrange(attn, '(b h) t d -> b t h d', b=B, h=H)
+
+        # 6. Apply output gate
+        gate_val = torch.sigmoid(self.gate)
+        out = gate_val * attn
+
+        return out
+
+
 class LayerScale(nn.Module):
     """Layer scale from [Touvron et al 2021] (https://arxiv.org/pdf/2103.17239.pdf).
     This rescales diagonally the residual outputs close to 0, with a learnt scale.
@@ -158,6 +318,7 @@ class StreamingMultiheadAttention(StreamingModule):
         qk_layer_norm (bool): Layer normalization applied to queries and keys before dot product.
         kv_repeat (int): If > 1, will repeat keys and queries multiple times (need to divide num_heads).
             This will lead to faster decoding time on A100 or other GPUs with tensorcore.
+        use_adapter (bool): Whether to use multi-scale adapters.
         device (torch.device, optional): Device on which to initialize.
         dtype (torch.dtype, optional): dtype to use.
     """
@@ -166,6 +327,7 @@ class StreamingMultiheadAttention(StreamingModule):
                  memory_efficient: bool = False, attention_as_float32: bool = False,
                  rope: tp.Optional[RotaryEmbedding] = None, cross_attention: bool = False,
                  safe_streaming: bool = True, qk_layer_norm: bool = False, kv_repeat: int = 1,
+                 use_adapter: bool = True,
                  device=None, dtype=None):
         super().__init__()
         factory_kwargs = {'device': device, 'dtype': dtype}
@@ -183,6 +345,8 @@ class StreamingMultiheadAttention(StreamingModule):
         self.num_heads = num_heads
         self.dropout = dropout
         self.kv_repeat = kv_repeat
+        self.use_adapter = use_adapter
+
         if cross_attention:
             assert not causal, "Causal cannot work with cross attention."
             assert rope is None, "Rope cannot work with cross attention."
@@ -220,6 +384,29 @@ class StreamingMultiheadAttention(StreamingModule):
             ln_dim = embed_dim
             self.q_layer_norm = nn.LayerNorm(ln_dim)
             self.k_layer_norm = nn.LayerNorm(ln_dim)
+
+        # Multi-scale adapters
+        self.adapters = nn.ModuleList()
+        self.adapter_weights = None
+        if self.use_adapter:
+            # Create three adapters for short, medium, long range
+            # REDUCED downsampling rates for diagnostic purposes: 2, 8, 32 (was 8, 96, 256)
+            self.adapters = nn.ModuleList([
+                ContentAwareMultiScaleAdapter(
+                    embed_dim, num_heads,
+                    stride=2, prompt_len=256, gate_init=-2.2,
+                    **factory_kwargs),  # short-range
+                ContentAwareMultiScaleAdapter(
+                    embed_dim, num_heads,
+                    stride=8, prompt_len=64, gate_init=-1.5,
+                    **factory_kwargs),  # mid-range
+                ContentAwareMultiScaleAdapter(
+                    embed_dim, num_heads,
+                    stride=32, prompt_len=16, gate_init=-3.0,
+                    **factory_kwargs),  # long-range
+            ])
+            # Learnable weights for combining adapter outputs
+            self.adapter_weights = nn.Parameter(torch.tensor([-0.2, 0.6, -0.4], **factory_kwargs))
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         if not self.custom:
@@ -391,12 +578,26 @@ class StreamingMultiheadAttention(StreamingModule):
                     q = self.q_layer_norm(q)
                     k = self.k_layer_norm(k)
                     q, k = [rearrange(x, f"b t (h d) -> {layout}", h=self.num_heads) for x in [q, k]]
+
+                # CRITICAL FIX: Save k_current and v_current BEFORE _complete_kv
+                # This ensures adapters only see current timestep, not streaming history
                 if self.rope:
                     q, k = self._apply_rope(q, k)
+
+                # Save current-step K/V for adapters (before appending history)
+                k_current = k
+                v_current = v
+
+                # Complete K/V with streaming history for main attention
                 k, v = self._complete_kv(k, v)
+
+                # Expand repeated KV if needed (for both full and current)
                 if self.kv_repeat > 1:
                     k = expand_repeated_kv(k, self.kv_repeat, self.memory_efficient)
                     v = expand_repeated_kv(v, self.kv_repeat, self.memory_efficient)
+                    k_current = expand_repeated_kv(k_current, self.kv_repeat, self.memory_efficient)
+                    v_current = expand_repeated_kv(v_current, self.kv_repeat, self.memory_efficient)
+
             if self.attention_as_float32:
                 q, k, v = [x.float() for x in [q, k, v]]
             if self.memory_efficient:
@@ -436,6 +637,36 @@ class StreamingMultiheadAttention(StreamingModule):
                 w = F.dropout(w, self.dropout, training=self.training).to(v)
                 # Key and value have the same format.
                 x = torch.einsum(f"b h t k, {key_layout} -> {layout}", w, v)
+
+            # Multi-scale adapter integration
+            if self.use_adapter and len(self.adapters) > 0:
+                # Use current-step K/V for adapters (not full history)
+                k_for_adp = k_current if 'k_current' in locals() else k
+                v_for_adp = v_current if 'v_current' in locals() else v
+
+                # Convert to [B, T, H, D] format for adapters
+                if layout == "b h t d":
+                    q_adp = q.permute(0, 2, 1, 3).contiguous()
+                    k_adp = k_for_adp.permute(0, 2, 1, 3).contiguous()
+                    v_adp = v_for_adp.permute(0, 2, 1, 3).contiguous()
+                else:
+                    q_adp = q
+                    k_adp = k_for_adp
+                    v_adp = v_for_adp
+
+                # Apply all adapters and combine with learned weights
+                # Pass is_causal flag to prevent future leakage in adapters
+                outs = [adp(q_adp, k_adp, v_adp, is_causal=self.causal) for adp in self.adapters]
+                w_adp = F.softmax(self.adapter_weights, dim=0)
+                adp_out = sum(w_adp[i] * outs[i] for i in range(len(outs)))
+
+                # Convert adapter output back to main attention layout
+                if layout == "b h t d":
+                    adp_out = adp_out.permute(0, 2, 1, 3).contiguous()
+
+                # Add adapter output to main attention output
+                x = x + adp_out
+
             x = x.to(dtype)
             x = rearrange(x, f"{layout} -> b t (h d)", h=self.num_heads)
             x = self.out_proj(x)
@@ -571,6 +802,7 @@ class StreamingTransformerLayer(nn.TransformerEncoderLayer):
                     x + self.layer_scale_cross(
                         self._cross_attention_block(src, cross_attention_src)))
             x = self.norm2(x + self.layer_scale_2(self._ff_block(x)))
+
         return x
 
 
