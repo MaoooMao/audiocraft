@@ -5,7 +5,6 @@ import torch
 from torch import nn
 
 from audiocraft.models import MusicGen
-from audiocraft.utils.checkpoint import load_checkpoint
 from audiocraft.data.audio import audio_write
 
 # Import the adapter class
@@ -46,7 +45,9 @@ lm = model.lm
 
 # === Load your finetuned checkpoint ===
 print(f"Loading checkpoint from {ckpt_path}")
-state = load_checkpoint(str(ckpt_path))
+# Use torch.load directly with weights_only=False for PyTorch 2.6+ compatibility
+# (OmegaConf DictConfig objects in checkpoint require this)
+state = torch.load(str(ckpt_path), map_location='cpu', weights_only=False)
 sd = (
     state.get("model_best_state")
     or state.get("fsdp_best_state")
