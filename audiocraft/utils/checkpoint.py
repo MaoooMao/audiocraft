@@ -90,7 +90,8 @@ def load_checkpoint(checkpoint_path: Path, is_sharded: bool = False) -> tp.Any:
         rank0_checkpoint_path = checkpoint_path.parent / checkpoint_name(use_fsdp=False)
         if rank0_checkpoint_path.exists():
             check_sharded_checkpoint(checkpoint_path, rank0_checkpoint_path)
-    state = torch.load(checkpoint_path, 'cpu')
+    # PyTorch 2.6+ requires weights_only=False for checkpoints with OmegaConf/custom objects
+    state = torch.load(checkpoint_path, 'cpu', weights_only=False)
     logger.info("Checkpoint loaded from %s", checkpoint_path)
     return state
 
